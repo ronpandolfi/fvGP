@@ -1107,6 +1107,48 @@ class FVGP:
             for i in range(len(mean)):
                 mean[i, :] = self.gp_mean_function(np.array([self.points[i]]), self)
             return mean
+    
+    def gp_logdet(self,M, device = "cpu"):
+        if device == "cpu":
+            s,a = np.linalg.logdet
+            return s * a
+        elif device == "gpu":
+            import torch
+            a = torch.Tensor(M).cuda()
+            return torch.logdet(a)
+
+    def gp_solve(self,M,b,M_inv = None, M_inv_old = None, solve_method = "solve", device = "cpu"):
+        sparsity = 1.0 - np.count_nonzero(M) / M.size
+        if solve_method == "solve":
+            if sparsity > 0.8:
+                x = scipy.sparse.linalg.spsolve(M,a)
+            else:
+                x = np.linalg.solve(M,a)
+        elif solve_method == "inv":
+            if M_inv is None: M_inv = self.safe_invert(M)
+            x = M_inv @ a
+        elif solve_method == "inv":
+            if M_inv is None: M_inv = self.safe_invert(M)
+            x = M_inv @ a
+        elif solve_method == "minres":
+            x, info = minres(M, a)
+            if info != 0:
+                print("MINRES solve failed, going back to inversion")
+                if M_inv is None: M_inv = self.safe_invert(M)
+                x = M_inv @ a
+        elif solve_method == "cg":
+            x, info = cg(K, y - mean)
+            if info != 0:
+                print("CG solve failed, going back to inversion")
+                if M_inv is None: M_inv = self.safe_invert(M)
+                x = K_inv @ (y - mean)
+        elif solve_method == "rank-n update":
+            if M_inv_old is None: exit("No old M_inv given, exit")
+            M_inv = self.covariance_update(M,M_Inv)
+            x = M_inv @ (a)
+        else:
+            print("No solve method specified in _compute_covariance_value_product().
+                   That might indicate a wrong input"); exit()
 
     ############################################################
     ######################finite difference derivative##########
