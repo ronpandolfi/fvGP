@@ -40,6 +40,7 @@ from scipy.sparse.linalg import cg
 from scipy.sparse.linalg import minres
 import itertools
 import time
+import torch
 
 class FVGP:
     """
@@ -111,6 +112,7 @@ class FVGP:
         gp_mean_function = None,
         init_input_hyper_parameters = None,
         init_output_hyper_parameters = None,
+        trainings_device = "cpu",
         ):
 
         """
@@ -132,6 +134,7 @@ class FVGP:
         self.points = points
         self.point_number = len(self.points)
         self.values = values
+        self.trainings_device = trainings_device
         ##########################################
         #######prepare value positions############
         ##########################################
@@ -470,10 +473,13 @@ class FVGP:
         
         x,K,K_inv = self._compute_covariance_value_product(hyper_parameters,values, variances, mean)
         y=values
-        sign, logdet = np.linalg.slogdet(K)
-        if sign == 0.0:
+        #x = x.numpy()
+        sign, logdet = self.gp_logdet(K, device = self.trainings_device)
+        #sign, logdet = np.linalg.slogdet(K)
+
+        if sign == 0.0: #necessary because apparentrly 0 * -inf = NaN
             return 0.5 * ((y - mean).T @ x)
-        return (0.5 * ((y - mean).T @ x)) + (0.5 * sign * logdet)
+        return (0.5 * ((y - mean).T @ x)) + (0.5 *sign.numpy()* logdet.numpy())
     ##################################################################################
     def log_likelihood_gradient_wrt_hyper_parameters(self, hyper_parameters, values, variances, mean):
         x,K,K_inv = self._compute_covariance_value_product(hyper_parameters,values, variances, mean)
@@ -534,27 +540,32 @@ class FVGP:
         K = self.compute_covariance(hyper_parameters, variances)
         y = values
         K_inv = None
-        if self.gp_system_solve_method == "inv":
-            K_inv = self.safe_invert(K)
-            x = K_inv @ (y - mean)
-        elif self.gp_system_solve_method == "minres":
-            x, info = minres(K, y - mean)
-            if info != 0:
-                print("MINRES solve failed, going back to inversion")
-                K_inv = self.safe_invert(self.prior_covariance)
-                x = K_inv @ (y - mean)
-        elif self.gp_system_solve_method == "cg":
-            x, info = cg(K, y - mean)
-            if info != 0:
-                print("CG solve failed, going back to inversion")
-                K_inv = self.safe_invert(K)
-                x = K_inv @ (y - mean)
-        elif self.gp_system_solve_method == "rank-n update":
-            K_inv = self.covariance_update(K)
-            x = K_inv @ (y - mean)
-        else:
-            print("No solve method specified in _compute_covariance_value_product(). That might indicate a wrong input"); exit()
+        #a = torch.Tensor(K)#.cuda()
+        #b = torch.Tensor(np.array([y-mean]).T) #.cuda()
+        #x,d = torch.solve(b,a)
+        x = self.gp_solve(K,y-mean)
         return x,K,K_inv
+        #if self.gp_system_solve_method == "inv":
+        #    K_inv = self.safe_invert(K)
+        #    x = K_inv @ (y - mean)
+        #elif self.gp_system_solve_method == "minres":
+        #    x, info = minres(K, y - mean)
+        #    if info != 0:
+        #        print("MINRES solve failed, going back to inversion")
+        #        K_inv = self.safe_invert(self.prior_covariance)
+        #        x = K_inv @ (y - mean)
+        #elif self.gp_system_solve_method == "cg":
+        #    x, info = cg(K, y - mean)
+        #    if info != 0:
+        #        print("CG solve failed, going back to inversion")
+        #        K_inv = self.safe_invert(K)
+        #        x = K_inv @ (y - mean)
+        #elif self.gp_system_solve_method == "rank-n update":
+        #    K_inv = self.covariance_update(K)
+        #    x = K_inv @ (y - mean)
+        #else:
+        #    print("No solve method specified in _compute_covariance_value_product(). That might indicate a wrong input"); exit()
+        #return x,K,K_inv
     ##################################################################################
     def compute_covariance(self, hyper_parameters, variances):
         """computes the covariance matrix from the kernel"""
@@ -666,23 +677,24 @@ class FVGP:
         else:
             mean = None
         if compute_posterior_covariances == True:
-            covariance_k_prod = np.zeros(k.shape)
-            info = np.zeros((len(k[0])))
-            if self.gp_system_solve_method == "inv" or self.gp_system_solve_method == "rank-n update":
-                covariance_k_prod = self.K_inv @ k
-            elif self.gp_system_solve_method == "minres":
-                for i in range(len(k[0])):
-                    covariance_k_prod[:, i], info[i] = minres(self.prior_covariance, k[:, i])
-            elif self.gp_system_solve_method == "cg":
-                for i in range(len(k[0])):
-                    covariance_k_prod[:, i], info[i] = cg(self.prior_covariance, k[:, i])
-                if any(info) != 0:
-                    for i in range(len(k[0])):
-                        covariance_k_prod[:, i], info[i] = minres(self.prior_covariance, k[:, i])
-            else:
-                print(
-                    "no valid solve method defined in fvGP; defined as: ", self.gp_system_solve_method
-                )
+            covariance_k_prod = self.gp_solve(self.prior_covariance,k)
+            #covariance_k_prod = np.zeros(k.shape)
+            #info = np.zeros((len(k[0])))
+            #if self.gp_system_solve_method == "inv" or self.gp_system_solve_method == "rank-n update":
+            #    covariance_k_prod = self.K_inv @ k
+            #elif self.gp_system_solve_method == "minres":
+            #    for i in range(len(k[0])):
+            #        covariance_k_prod[:, i], info[i] = minres(self.prior_covariance, k[:, i])
+            #elif self.gp_system_solve_method == "cg":
+            #    for i in range(len(k[0])):
+            #        covariance_k_prod[:, i], info[i] = cg(self.prior_covariance, k[:, i])
+            #    if any(info) != 0:
+            #        for i in range(len(k[0])):
+            #            covariance_k_prod[:, i], info[i] = minres(self.prior_covariance, k[:, i])
+            #else:
+            #    print(
+            #        "no valid solve method defined in fvGP; defined as: ", self.gp_system_solve_method
+            #    )
             a = kk - (k.T @ covariance_k_prod)
             diag = np.diag(a)
             diag = np.where(diag<0.0,0.0,diag)
@@ -1110,46 +1122,61 @@ class FVGP:
     
     def gp_logdet(self,M, device = "cpu"):
         if device == "cpu":
-            s,a = np.linalg.logdet
-            return s * a
+            a = torch.Tensor(M)
+            s,logdet = torch.slogdet(a)
+            return s,logdet
         elif device == "gpu":
-            import torch
             a = torch.Tensor(M).cuda()
-            return torch.logdet(a)
+            s, logdet = torch.slogdet(a)
+            return s,logdet
 
     def gp_solve(self,M,b,M_inv = None, M_inv_old = None, solve_method = "solve", device = "cpu"):
+        """
+        A function that solves the system MX=b tailored to gp
+        inputs:
+        -------
+            2d numpy array A
+            2d numpy array b
+        optional inputs:
+        ----------------
+            M_inv: if available the inverse of the matrix M
+            M_inv_old: if available an old inverse of the smaller M
+            solve_method: "solve" ...
+            device: "cpu" or "gpu", default = "cpu"
+        """
         sparsity = 1.0 - np.count_nonzero(M) / M.size
         if solve_method == "solve":
             if sparsity > 0.8:
-                x = scipy.sparse.linalg.spsolve(M,a)
+                M = scipy.sparse.coo_matrix(M)
+                x = scipy.sparse.linalg.spsolve(M,b)
             else:
-                x = np.linalg.solve(M,a)
-        elif solve_method == "inv":
-            if M_inv is None: M_inv = self.safe_invert(M)
-            x = M_inv @ a
-        elif solve_method == "inv":
-            if M_inv is None: M_inv = self.safe_invert(M)
-            x = M_inv @ a
-        elif solve_method == "minres":
-            x, info = minres(M, a)
-            if info != 0:
-                print("MINRES solve failed, going back to inversion")
-                if M_inv is None: M_inv = self.safe_invert(M)
-                x = M_inv @ a
-        elif solve_method == "cg":
-            x, info = cg(K, y - mean)
-            if info != 0:
-                print("CG solve failed, going back to inversion")
-                if M_inv is None: M_inv = self.safe_invert(M)
-                x = K_inv @ (y - mean)
-        elif solve_method == "rank-n update":
-            if M_inv_old is None: exit("No old M_inv given, exit")
-            M_inv = self.covariance_update(M,M_Inv)
-            x = M_inv @ (a)
+                x = np.linalg.solve(M,b)
+        #elif solve_method == "inv":
+        #    if M_inv is None: M_inv = self.safe_invert(M)
+        #    x = M_inv @ a
+        #elif solve_method == "inv":
+        #    if M_inv is None: M_inv = self.safe_invert(M)
+        #    x = M_inv @ a
+        #elif solve_method == "minres":
+        #    x, info = minres(M, a)
+        #    if info != 0:
+        #        print("MINRES solve failed, going back to inversion")
+        #        if M_inv is None: M_inv = self.safe_invert(M)
+        #        x = M_inv @ a
+        #elif solve_method == "cg":
+        #    x, info = cg(K, y - mean)
+        #    if info != 0:
+        #        print("CG solve failed, going back to inversion")
+        #        if M_inv is None: M_inv = self.safe_invert(M)
+        #        x = K_inv @ (y - mean)
+        #elif solve_method == "rank-n update":
+        #    if M_inv_old is None: exit("No old M_inv given, exit")
+        #    M_inv = self.covariance_update(M,M_Inv)
+        #    x = M_inv @ (a)
         else:
-            print("No solve method specified in _compute_covariance_value_product().
+            print("No solve method specified in _compute_covariance_value_product()\
                    That might indicate a wrong input"); exit()
-
+        return x
     ############################################################
     ######################finite difference derivative##########
     ############################################################
