@@ -40,7 +40,8 @@ def main():
     #values[:,1] = func(points)[0]*2.44
     #values[:,2] = func(points)[0]*3.55
     #########################################
-    my_gp = FVGP(1,1,1,points,values,gp_kernel_function = stationary_kernel, compute_device = "cpu")
+    my_gp = FVGP(1,1,1,points,values,gp_kernel_function = stationary_kernel,
+            init_hyper_parameters = [10.0,10.0],compute_device = "cpu")
     #my_gp = FVGP(1,1,3,points,values,gp_kernel_function = mt_kernel, compute_device = "cpu")
     #my_gp = FVGP(1,1,1,points,values,gp_kernel_function = non_stationary_kernel, compute_device = "cpu")
 
@@ -61,8 +62,8 @@ def main():
     plt.show()
     """
 
-    #training_method = 'hgdl'
-    training_method = 'global'
+    training_method = 'hgdl'
+    #training_method = 'global'
 
     my_gp.train([[100.0,200.0],[5.0,10.0]],
             init_hyper_parameters = [10.0,10.0],
@@ -70,7 +71,7 @@ def main():
             optimization_pop_size = 20,
             optimization_tolerance = 0.0001,
             optimization_max_iter = 200,
-            dask_client = None)
+            dask_client = True)
     if training_method == "hgdl":
         print("lets see how the hyper-parameters are changing")
         for i in range(10):
