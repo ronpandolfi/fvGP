@@ -2,18 +2,18 @@ import time
 import scipy.sparse as sparse
 import scipy.sparse.linalg as solve
 import numpy as np
-from hgdl.hgdl import HGDL
 import dask.distributed as distributed
 import matplotlib.pyplot as plt
 from scipy.sparse.linalg import spsolve
 from scipy.sparse.linalg import splu
 from scipy.optimize import differential_evolution
-
-
+from scipy.sparse import coo_matrix
+import gc
+from scipy.sparse.linalg import eigsh
 
 class gp2Scale():
     """
-    gp2Scale class: Provides tools for a Lagre-Scale single-task GP.
+    gp2Scale class: Provides tools for a Large-Scale single-task GP.
 
     symbols:
         N: Number of points in the data set
@@ -101,7 +101,7 @@ class gp2Scale():
         #######define kernel and mean function####
         ##########################################
         if callable(gp_kernel_function): self.kernel = gp_kernel_function
-        else: raise Exception("A kernel callbale has to be provided!")
+        #else: raise Exception("A kernel callable has to be provided!")
         #self.d_kernel_dx = self.d_gp_kernel_dx
 
         self.gp_mean_function = gp_mean_function
@@ -122,10 +122,11 @@ class gp2Scale():
         #compute the prior########################
         ##########################################
         self.client = self._init_dask_client(covariance_dask_client)
+        self.st = time.time()
         self.compute_prior_fvGP_pdf()
-        print("gpLG successfully initiated, here is some info about the prior covarianve matrix:")
+        print("gpLG successfully initiated, here is some info about the prior covariance matrix:")
         print("non zero elements: ", self.SparsePriorCovariance.count_nonzero())
-        print("Size in GBits:     ", self.SparsePriorCovariance.data.nbytes)
+        print("Size in GBits:     ", self.SparsePriorCovariance.data.nbytes/1000000000)
         print("Sparsity: ",self.SparsePriorCovariance.count_nonzero()/float(self.point_number)**2)
         if self.point_number <= 5000:
             print("Here is an image:")
@@ -166,19 +167,25 @@ class gp2Scale():
     ##################################################################################
     def _compute_covariance_value_product(self, hyperparameters,values, variances, mean):
         K = self.compute_covariance(hyperparameters, variances)
+        print("COVARIANCE COMPUTED")
+        print("exec time:", time.time() - self.st)
+        #eigval,eigvec = eigsh(K)
+        #print("condition number: ", np.max(eigval)/np.min(eigval))
+        #print("Sparsity: ",K.count_nonzero()/float(self.point_number)**2)
         y = values - mean
         x = self.solve(K.tocsc(), y)
-        #if self.use_inv is True: x = self.K_inv @ y
-        #else: x = self.solve(K, y)
-        if x.ndim == 2: x = x[:,0]
         return x,K
     ##################################################################################
     def compute_covariance(self, hyperparameters, variances):
-        """computes the covariance matrix from the kernel"""
-        SparsePriorCovariance = sparse.eye(self.point_number, format="lil")
-        tasks = []
+        """computes the covariance matrix from the kernel on HPC in sparse format"""
+        #SparsePriorCovariance = sparse.eye(self.point_number, format="coo")
+        SparsePriorCovariance = sparse.coo_matrix((self.point_number,self.point_number))
+        futures = []
+        finished_futures = []
+        worker_future_dicts = [{"worker": worker, "active future key" : None} for worker in self.workers["worker"]]
+        scatter_data = {"x_data":self.x_data, "hps": hyperparameters}
+        scatter_future = self.client.scatter(scatter_data,workers = self.workers["worker"])
         for i in range(self.num_batches):
-            #print("(",i,") of ", self.num_batches - 1)
             beg_i = i * self.batch_size
             end_i = min((i+1) * self.batch_size, self.point_number)
             if beg_i == end_i: continue
@@ -188,59 +195,115 @@ class gp2Scale():
                 end_j = min((j+1) * self.batch_size, self.point_number)
                 if beg_j == end_j: continue
                 batch2 = self.x_data[beg_j : end_j]
-                if self.point_number >= 100000: print("submitted batch. i:", beg_i,end_i,"   j:",beg_j,end_j)
-                data = {"batch1":batch1,"batch2": batch2, "hps" : hyperparameters, "range_i": (beg_i,end_i), "range_j": (beg_j,end_j), "mode": "prior"}
-                tasks.append(self.client.submit(self.kernel,data))
-                SparsePriorCovariance, tasks = self.collect_submatrices(tasks, SparsePriorCovariance)
+                ######submit work to specified worker if active_futures < number_of_workers
+                worker_not_found = True
+                while worker_not_found:
+                    worker_dict, index = self.get_idle_worker(worker_future_dicts) #self.workers["worker"][int(count - ((count//self.number_of_workers) * self.number_of_workers))]
+                    if worker_dict is not None:
+                        ##this is what we do whennwe have a worker to submit to ...
+                        worker_not_found = False #print("worker found: ", worker_dict["worker"]," at index ", index)
+                        if self.point_number >= 100000: print("submitted batch. i:", beg_i,end_i,"   j:",beg_j,end_j, "to worker ", worker_dict["worker"])
+                        data = {"scattered_data": scatter_future, "range_i": (beg_i,end_i), "range_j": (beg_j,end_j), "mode": "prior"}
+                        futures.append(self.client.submit(kernel_function,data, workers = worker_dict["worker"]))
+                        worker_future_dicts[index]["active future key"] = futures[-1].key
+                        #gc.collect() ##not sure if necessary
+                        #if len(active_futures) >= self.number_of_workers: 
+                    else:
+                        ##this is what we do when we ran out of workers
+                        SparsePriorCovariance,futures = self.collect_submatrices(futures, finished_futures, worker_future_dicts, SparsePriorCovariance)
+                        time.sleep(0.1)
+
                 if SparsePriorCovariance.count_nonzero() > self.entry_limit or SparsePriorCovariance.data.nbytes > self.ram_limit:
-                    for future in tasks: self.client.cancel(tasks); self.client.shutdown()
+                    print("Non-zero entries in matrix:  ", SparsePriorCovariance.count_nonzero()," RAM usage in bytes: ",SparsePriorCovariance.data.nbytes)
+                    for future in futures: self.client.cancel(futures); self.client.shutdown()
                     raise Exception("Matrix is not sparse enough. We are running the risk of a total crash. exit()")
                 #else: print("Sparsity: ",SparsePriorCovariance.count_nonzero()/float(self.point_number)**2,"  ",SparsePriorCovariance.count_nonzero(),"elements of allowed ", self.entry_limit)
 
-        SparsePriorCovariance = self.collect_remaining_submatrices(tasks, SparsePriorCovariance)
-        self.client.cancel(tasks)
-        diag = sparse.eye(self.point_number, format="lil")
+        #SparsePriorCovariance = self.collect_remaining_submatrices(futures, finished_futures, worker_future_dicts, SparsePriorCovariance)
+        SparsePriorCovariance = self.collect_remaining_submatrices(futures, SparsePriorCovariance)
+        self.client.cancel(futures)
+        diag = sparse.eye(self.point_number, format="coo")
         diag.setdiag(variances)
         SparsePriorCovariance = SparsePriorCovariance + diag
-        #plt.figure(figsize = (15,15))
-        #plt.imshow(SparsePriorCovariance.toarray())
-        #plt.show()
 
         return SparsePriorCovariance
 
-    def collect_submatrices(self,futures, SparsePriorCovariance):
-        #get a part of the covariance, and fit into the sparse one, but only the vales needed
+    def collect_submatrices(self,futures, finished_futures, worker_future_dicts, SparsePriorCovariance):
+        #get a part of the covariance, and fit into the sparse one, but only the values needed
         #throw warning if too many values are not zero
         new_futures = []
         for future in futures:
-            if future.status == "finished":
+            if future.status == "finished":   # and future.key not in finished_futures:
+                st = time.time()
                 if self.point_number >= 100000: print("Future", future, " has finished its work")
-                CoVariance_sub, data = future.result()
-                zero_indices = np.where(CoVariance_sub < 1e-16)
-                CoVariance_sub[zero_indices] = 0.0
-                SparseCov_sub = sparse.lil_matrix(CoVariance_sub)
-                SparsePriorCovariance[data["range_i"][0]:data["range_i"][1],data["range_j"][0]:data["range_j"][1]] = SparseCov_sub
-                SparsePriorCovariance[data["range_j"][0]:data["range_j"][1],data["range_i"][0]:data["range_i"][1]] = SparseCov_sub.transpose()
-                #
-                #plt.imshow(SparsePriorCovariance.toarray())
-                #plt.show()
-                #
+                SparseCov_sub, ranges = future.result()
+                if SparseCov_sub.count_nonzero()/float(self.batch_size)**2 > 0.1: 
+                    print("WARNING: Collected submatrix not sparse")
+                    print("Sparsity: ", SparseCov_sub.count_nonzero()/float(self.batch_size)**2)
+                SparsePriorCovariance = self.insert(SparsePriorCovariance,SparseCov_sub, ranges[0], ranges[1])
+                #finished_futures.append(future.key)
+                self.free_worker(worker_future_dicts, future.key)
             else: new_futures.append(future)
+        futures = new_futures
+        #plt.imshow(SparsePriorCovariance.toarray())
+        #plt.show()
+        #input()
 
-        return SparsePriorCovariance, new_futures
+        return SparsePriorCovariance,futures
+
+#    def collect_remaining_submatrices(self,futures, finished_futures, worker_future_dicts, SparsePriorCovariance):
+#        #get a part of the covariance, and fit into the sparse one, but only the values needed
+#        #throw warning if too many values are not zero
+#        results_remaining = True
+#        while results_remaining:
+#            results_remaining = False
+#            for future in futures:
+#                if future.status == "finished": # and future.key not in finished_futures:
+#                    st = time.time()
+#                    if self.point_number >= 100000: print("Collecting remaining future", future)
+#                    SparseCov_sub, ranges = future.result()
+#                    if SparseCov_sub.count_nonzero()/float(self.batch_size)**2 > 0.1: 
+#                        print("WARNING: Collected submatrix not sparse")
+#                        print("Sparsity: ", SparseCov_sub.count_nonzero()/float(self.batch_size)**2)
+#                    SparsePriorCovariance = self.insert(SparsePriorCovariance,SparseCov_sub, ranges[0], ranges[1])
+#                    #finished_futures.append(future.key)
+#                    self.free_worker(worker_future_dicts, future.key)
+#                elif future.status != "finished": # and future.key not in finished_futures: 
+#                    results_remaining = True
+                #elif future.status == "finished" and future.key in finished_futures: print("already collected")
+                #else: print("Discover remaining future with status: ",future.status)
+#        return SparsePriorCovariance
 
 
     def collect_remaining_submatrices(self, futures, SparsePriorCovariance):
         results = self.client.gather(futures)
         for result in results:
-            CoVariance_sub, data = result
-            zero_indices = np.where(CoVariance_sub < 1e-16)
-            CoVariance_sub[zero_indices] = 0.0
-            SparseCov_sub = sparse.lil_matrix(CoVariance_sub)
-            SparsePriorCovariance[data["range_i"][0]:data["range_i"][1],data["range_j"][0]:data["range_j"][1]] = SparseCov_sub
-            SparsePriorCovariance[data["range_j"][0]:data["range_j"][1],data["range_i"][0]:data["range_i"][1]] = SparseCov_sub.transpose()
+            SparseCov_sub, ranges = result
+            if SparseCov_sub.count_nonzero()/float(self.batch_size)**2 > 0.1: 
+                print("WARNING: Collected submatrix not sparse")
+                print("Sparsity: ", SparseCov_sub.count_nonzero()/float(self.batch_size)**2)
+            SparsePriorCovariance = self.insert(SparsePriorCovariance,SparseCov_sub, ranges[0], ranges[1])
         return SparsePriorCovariance
-    
+
+    def get_idle_worker(self,worker_future_dicts):
+        for dictionary in worker_future_dicts:
+            if dictionary["active future key"] is None: return dictionary, worker_future_dicts.index(dictionary)
+        return None,None
+
+    def free_worker(self,worker_future_dicts, key):
+        for dictionary in worker_future_dicts:
+            if dictionary["active future key"] == key: dictionary["active future key"] = None; break
+
+    def insert(self, bg,sm, i ,j):
+        if i != j:
+            row = np.concatenate([bg.row,sm.row + i, sm.col + j])
+            col = np.concatenate([bg.col,sm.col + j, sm.row + i])
+            res = coo_matrix((np.concatenate([bg.data,sm.data,sm.data]),(row,col)), shape = bg.shape )
+        else:
+            row = np.concatenate([bg.row,sm.row + i])
+            col = np.concatenate([bg.col,sm.col + j])
+            res = coo_matrix((np.concatenate([bg.data,sm.data]),(row,col)), shape = bg.shape)
+        return res
     ##################################################################################
     ##################################################################################
     ##################################################################################
@@ -254,14 +317,14 @@ class gp2Scale():
         if dask_client is None:
             dask_client = distributed.Client()
             print("No dask client provided to gp2Scale. Using the local client", flush = True)
-        else: print("dask client provided to HGDL", flush = True)
+        else: print("dask client provided to gp2Scale", flush = True)
         client = dask_client
         worker_info = list(client.scheduler_info()["workers"].keys())
         if not worker_info: raise Exception("No workers available")
-        self.workers = {"host": worker_info[0],
-                "walkers": worker_info[1:]}
-        print("Host ",self.workers["host"]," has ", len(self.workers["walkers"])," workers.")
-        self.number_of_walkers = len(self.workers["walkers"])
+        self.workers = {#"host": worker_info[0],
+                "worker": worker_info[0:]}
+        print("We have ", len(self.workers["worker"])," workers ready to go.")
+        self.number_of_workers = len(self.workers["worker"])
         return client
 
     ##################################################################################
@@ -391,7 +454,7 @@ class gp2Scale():
         return hyperparameters
 
 
-    def log_likelihood(self,hyperparameters):
+    def log_likelihood(self,hyperparameters, xK = None ):
         """
         computes the marginal log-likelihood
         input:
@@ -401,13 +464,13 @@ class gp2Scale():
         """
         mean = np.zeros((self.point_number))   #self.mean_function(self,self.x_data,hyperparameters) * 0.0
         if mean.ndim > 1: raise Exception("Your mean function did not return a 1d numpy array!")
-        x,K = self._compute_covariance_value_product(hyperparameters,self.y_data, self.variances, mean)
+        if xK is None: x,K = self._compute_covariance_value_product(hyperparameters,self.y_data, self.variances, mean)
+        else: x,K = xK[0],xK[1]
         y = self.y_data - mean
         sign, logdet = self.slogdet(K.tocsc())
         n = len(y)
         if sign == 0.0: res = (0.5 * (y.T @ x)) + (0.5 * n * np.log(2.0*np.pi))
         else: res = (0.5 * (y.T @ x)) + (0.5 * sign * logdet) + (0.5 * n * np.log(2.0*np.pi))
-        print("Evaluating marginal log-likelihood", res)
         return res
 
 
@@ -420,72 +483,30 @@ class gp2Scale():
     ##################################################################################
     ##################################################################################
     ##################################################################################
-
-    def minimumSwaps(self,arr):
-        a = dict(enumerate(arr))
-        b = {v:k for k,v in a.items()}
-        count = 0
-        for i in a:
-            x = a[i]
-            if x!=i:
-                y = b[i]
-                a[y] = x
-                b[x] = y
-                count+=1
-        return count
-
     def slogdet(self, A):
         """
         fvGPs slogdet method based on torch
         """
-        lu = splu(A)
-        diagL = lu.L.diagonal()
-        diagU = lu.U.diagonal()
-        diagL = diagL.astype(np.complex128)
-        diagU = diagU.astype(np.complex128)
-        logdet= np.real(np.nansum(np.log(diagL)) + np.nansum(np.log(diagU)))
-        swap_sign = self.minimumSwaps(lu.perm_r)
-        sign = np.sign(np.real(swap_sign*np.sign(diagL).prod()*np.sign(diagU).prod()))
+        eigval,eigvec = eigsh(A)
+        i0 = np.where(eigval == 0.0)
+        eigval[i0] = 1e-6
+        logdet = np.sum(np.log(eigval))
+        sign = 1.
         return sign, logdet
-        #s,l = np.linalg.slogdet(A)
-        #return s,l
-        #if self.compute_device == "cpu":
-        #    sign, logdet = torch.slogdet(A)
-        #    logdet = torch.nan_to_num(logdet)
-        #    return sign, logdet
-        #elif self.compute_device == "gpu" or self.compute_device == "multi-gpu":
-        #    sign, logdet = torch.slogdet(A)
-        #    sign = sign.cpu()
-        #    logdet = logdet.cpu()
-        #    logdet = torch.nan_to_num(logdet)
-        #    return sign, logdet
 
-    def inv(self, A):
-            B = torch.inverse(A)
-            return B
 
     def solve(self, A, b):
         #####for sparsity:
-        #zero_indices = np.where(A < 1e-16)
-        #A[zero_indices] = 0.0
-        #if self.is_sparse(A):
         try:
-            x = spsolve(A,b)
-            return x
+            x,info = solve.cg(A,b, maxiter = 20)
         except Exception as e:
             print("fvGP: Sparse solve did not work out.")
             print("reason: ", str(e))
-    ##################################################################################
-    def add_to_diag(self,Matrix, Vector):
-        d = torch.einsum("ii->i", Matrix)
-        d += Vector
-        return Matrix
-    #def is_sparse(self,A):
-    #    if float(np.count_nonzero(A))/float(len(A)**2) < 0.01: return True
-    #    else: return False
-    #def how_sparse_is(self,A):
-    #    return float(np.count_nonzero(A))/float(len(A)**2)
-
+            info = 1
+        if info > 0:
+            print("cg did not work out, let's do a minres")
+            x,info = solve.minres(A,b, show = True)
+        return x
     ##################################################################################
     ##################################################################################
     ##################################################################################
@@ -553,11 +574,55 @@ class gp2Scale():
         p = np.array(x_iset)
         if p.ndim == 1: p = np.array([p])
         if len(p[0]) != len(self.x_data[0]): p = np.column_stack([p,np.zeros((len(p)))])
-        k = self.kernel({"batch1": self.x_data,"batch2":p,"hps" : self.hyperparameters, "mode" : "post"})[0]
+        k = kernel_function({"x_data":self.x_data,"x2":p, "hps" : self.hyperparameters, "mode" : "post"})[0]
         A = k.T @ self.covariance_value_prod
         #posterior_mean = self.mean_function(self,p,self.hyperparameters) + A
         posterior_mean = A
         return {"x": p,
                 "f(x)": posterior_mean}
 
+def get_distance_matrix(x1,x2,hps):
+    d = np.zeros((len(x1),len(x2)))
+    for i in range(x1.shape[1]):
+        d += ((x1[:,i].reshape(-1, 1) - x2[:,i])*hps[i+1])**2
+    return np.sqrt(d)
+def f(x, hps):
+    f = np.ones((len(x)))
+    i0= np.where(hps < 0.5)
+    f[i0] = 0.0
+    return f
 
+def insert(bg,sm, i ,j):
+    if i != j:
+        row = np.concatenate([bg.row,sm.row + i, sm.col + j])
+        col = np.concatenate([bg.col,sm.col + j, sm.row + i])
+        res = coo_matrix((np.concatenate([bg.data,sm.data,sm.data]),(row,col)), shape = bg.shape )
+    else:
+        row = np.concatenate([bg.row,sm.row + i])
+        col = np.concatenate([bg.col,sm.col + j])
+        res = coo_matrix((np.concatenate([bg.data,sm.data]),(row,col)), shape = bg.shape )
+    return res
+
+def kernel_function(data):
+    ####here we can also ingest any other callable() kernel (can be written in data)
+    #st = time.time()
+    hps= data["scattered_data"]["hps"]
+    mode = data["mode"]
+    hpsf = hps[3:]
+    if mode == "prior":
+        x1 = data["scattered_data"]["x_data"][data["range_i"][0]:data["range_i"][1]]
+        x2 = data["scattered_data"]["x_data"][data["range_j"][0]:data["range_j"][1]]
+        d = get_distance_matrix(x1,x2,hps)
+        range1 = data["range_i"]
+        range2 = data["range_j"]
+        k = np.outer(f(x1, hpsf[range1[0]:range1[1]]),f(x2,hpsf[range2[0]:range2[1]])) * hps[0] * np.exp(-d**2)
+    else: 
+        x1 = data["x_data"]
+        x2 = data["x2"]
+        d = get_distance_matrix(x1,x2,hps)
+        k = np.outer(f(x1, hpsf[0:len(x1)]),f(x2,np.ones(len(x2)))) * hps[0] * np.exp(-d**2)
+    zero_indices = np.where(k < 1e-16)
+    k[zero_indices] = 0.0
+    k_sparse = sparse.coo_matrix(k)
+
+    return k_sparse, (data["range_i"][0],data["range_j"][0])
