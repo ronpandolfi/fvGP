@@ -1,20 +1,14 @@
 #!/usr/bin/env python
 import inspect
-import time
-import itertools
-from functools import partial
-import math
 
 import dask.distributed as distributed
-import matplotlib.pyplot as plt
 import numpy as np
-from scipy.optimize import differential_evolution
-from scipy.optimize import minimize
-from loguru import logger
 import torch
+from loguru import logger
+from scipy.optimize import differential_evolution, minimize
 
-from .mcmc import mcmc
 from hgdl.hgdl import HGDL
+from .mcmc import mcmc
 
 
 class GP():
@@ -198,7 +192,8 @@ class GP():
             self.variances = np.array(variances)
         else:
             raise Exception("Variances are not given in an allowed format. Give variances as 1d numpy array")
-        if (self.variances < 0.0).any(): raise Exception("Negative measurement variances communicated to fvgp.")
+        if (self.variances < 0.0).any():
+            raise Exception("Negative measurement variances communicated to fvgp.")
         ######################################
         #####transform to index set###########
         ######################################
@@ -829,14 +824,12 @@ class GP():
         if p.ndim == 1: p = np.array([p])
         if len(p[0]) != len(self.x_data[0]): p = np.column_stack([p,np.zeros((len(p)))])
 
-        k = self.kernel(self.x_data,p,self.hyperparameters,self)
         f = self.mean_function(self,p,self.hyperparameters)
         eps = 1e-6
         if direction is not None:
             x1 = np.array(p)
             x1[:,direction] = x1[:,direction] + eps
             mean_der = (self.mean_function(self,x1,self.hyperparameters) - f)/eps
-            k = self.kernel(self.x_data,p,self.hyperparameters,self)
             k_g = self.d_kernel_dx(p,self.x_data, direction,self.hyperparameters)
             posterior_mean_grad = mean_der + (k_g @ self.covariance_value_prod)
         else:
@@ -845,7 +838,6 @@ class GP():
                 x1 = np.array(p)
                 x1[:,direction] = x1[:,direction] + eps
                 mean_der = (self.mean_function(self,x1,self.hyperparameters) - f)/eps
-                k = self.kernel(self.x_data,p,self.hyperparameters,self)
                 k_g = self.d_kernel_dx(p,self.x_data, direction,self.hyperparameters)
                 posterior_mean_grad[:,direction] = mean_der + (k_g @ self.covariance_value_prod)
             direction = "ALL"
@@ -921,7 +913,6 @@ class GP():
         k_covariance_prod = self.solve(self.prior_covariance,k)
         if direction is not None:
             k_g = self.d_kernel_dx(p,self.x_data, direction,self.hyperparameters).T
-            kk =  self.kernel(p, p,self.hyperparameters,self)
             x1 = np.array(p)
             x2 = np.array(p)
             eps = 1e-6
@@ -936,7 +927,6 @@ class GP():
             grad_v = np.zeros((len(p),len(p[0])))
             for direction in range(len(p[0])):
                 k_g = self.d_kernel_dx(p,self.x_data, direction,self.hyperparameters).T
-                kk =  self.kernel(p, p,self.hyperparameters,self)
                 x1 = np.array(p)
                 x2 = np.array(p)
                 eps = 1e-6
@@ -991,8 +981,6 @@ class GP():
         if p.ndim == 1: p = np.array([p])
         if len(p[0]) != len(self.x_data[0]): p = np.column_stack([p,np.zeros((len(p)))])
 
-        k = self.kernel(self.x_data,p,self.hyperparameters,self)
-        kk = self.kernel(p, p,self.hyperparameters,self)
         k_g = self.d_kernel_dx(p,self.x_data, direction,self.hyperparameters).T
         x1 = np.array(p)
         x2 = np.array(p)
