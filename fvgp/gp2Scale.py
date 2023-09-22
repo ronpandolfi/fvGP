@@ -253,7 +253,10 @@ class gp2Scale():
                 ##make workers available that are not actively computing
                 while not idle_workers:
                     idle_workers, futures, finished_futures = self.free_workers(futures, finished_futures)
-                    time.sleep(0.1)
+                    if idle_workers:
+                        break
+                    else:
+                        time.sleep(0.01)
 
                 ####collect finished workers but only if actor is not busy, otherwise do it later
                 if len(finished_futures) >= 1000:
